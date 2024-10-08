@@ -1,0 +1,167 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <DHT.h>
+
+// Firebase Setup
+#define FIREBASE_HOST "https://smart-integrated-farming-default-rtdb.firebaseio.com/"
+
+#define FIREBASE_AUTH "AIzaSyBC9d4A9XGmMhPxcfLLAgeEC0ttovw7qdA"
+#define WIFI_SSID "smartfarm"
+#define WIFI_PASSWORD "123456789"
+
+#define DHTPIN 27
+#define DHTTYPE DHT11
+#define TdsSensorPin 34 // Gunakan pin analog yang tepat untuk ESP32
+#define VREF 3.3        // Tegangan referensi ESP32 adalah 3.3V
+#define SCOUNT 30
+#define RELAY_PIN 25    // Pin relay
+
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0, copyIndex = 0;
+float averageVoltage = 0, tdsValue = 0, temperature = 25;
+
+
+DHT dht(DHTPIN, DHTTYPE);
+FirebaseData firebaseData;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Koneksi ke WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println("Connected to WiFi!");
+
+  // Mulai koneksi ke Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+
+  dht.begin();
+  pinMode(TdsSensorPin, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // Relay off by default
+}
+
+void loop() {
+  // Membaca data suhu dan kelembaban dari sensor DHT11
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  // Mengecek apakah pembacaan sensor berhasil
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+
+  // Memperbarui nilai TDS
+  updateTds();
+
+  // Menentukan status kelembaban dan suhu
+  String humidityStatus = (humidity < 70) ? "1" : "0";
+  String temperatureStatus = (temperature >= 0 && temperature <= 28) ? "1" : "0";
+  String tdsStatus = (tdsValue >= 690 && tdsValue <= 910) ? "1" : "0";
+
+  // Kontrol relay berdasarkan status suhu
+  String relayStatus = "0";
+  if (temperatureStatus == "1") {
+    digitalWrite(RELAY_PIN, LOW); // Relay on
+    relayStatus = "1";
+  } else {
+    digitalWrite(RELAY_PIN, HIGH); // Relay off
+    relayStatus = "0";
+  }
+
+  // Mencetak data ke Serial Monitor
+  Serial.print("Suhu: ");
+  Serial.print(temperature);
+  Serial.print(" °C | Status Suhu: ");
+  Serial.print(temperatureStatus);
+  Serial.print(" | Kelembaban: ");
+  Serial.print(humidity);
+  Serial.print(" % | Status Kelembaban: ");
+  Serial.print(humidityStatus);
+  Serial.print(" | TDS: ");
+  Serial.print(tdsValue, 2); // Cetak TDS dengan 2 angka di belakang koma
+  Serial.print(" ppm | Status TDS: ");
+  Serial.print(tdsStatus);
+  Serial.print(" | Status Relay: ");
+  Serial.println(relayStatus);
+
+  // Mengirim data ke Firebase
+  Firebase.setFloat(firebaseData, "/S1/temp", temperature);
+  Firebase.setFloat(firebaseData, "/S1/hum", humidity);
+  
+  // Mengonversi nilai TDS ke string dengan 2 angka di belakang koma
+  String tdsValueStr = String(tdsValue, 2);
+  Firebase.setString(firebaseData, "/S1/tds", tdsValueStr);
+  
+  Firebase.setString(firebaseData, "/S1/tempstat", temperatureStatus);
+  Firebase.setString(firebaseData, "/S1/humstat", humidityStatus);
+  Firebase.setString(firebaseData, "/S1/tdsstat", tdsStatus);
+  Firebase.setString(firebaseData, "/S1/keran", relayStatus);
+
+  delay(1000);
+}
+
+
+void updateTds() {
+  static unsigned long analogSampleTimepoint = millis();
+  if (millis() - analogSampleTimepoint > 40U) {
+    analogSampleTimepoint = millis();
+    int rawValue = analogRead(TdsSensorPin); // Read the analog value
+    Serial.print("Analog Value: ");
+    Serial.println(rawValue); // Debugging line to see the raw analog value
+    analogBuffer[analogBufferIndex] = rawValue;
+    analogBufferIndex++;
+    if (analogBufferIndex == SCOUNT)
+      analogBufferIndex = 0;
+  }
+
+  static unsigned long printTimepoint = millis();
+  if (millis() - printTimepoint > 800U) {
+    printTimepoint = millis();
+    for (copyIndex = 0; copyIndex < SCOUNT; copyIndex++)
+      analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+
+    averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 4095.0;
+    float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+    float compensationVoltage = averageVoltage / compensationCoefficient;
+    tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage
+                - 255.86 * compensationVoltage * compensationVoltage
+                + 857.39 * compensationVoltage) * 0.5;
+
+    // Debugging lines to see calculated values
+    Serial.print("Average Voltage: ");
+    Serial.println(averageVoltage, 2); // Cetak tegangan rata-rata dengan 2 angka di belakang koma
+    Serial.print("Compensation Voltage: ");
+    Serial.println(compensationVoltage, 2); // Cetak tegangan kompensasi dengan 2 angka di belakang koma
+    Serial.print("TDS Value: ");
+    Serial.println(tdsValue, 2); // Cetak TDS dengan 2 angka di belakang koma
+  }
+}
+
+int getMedianNum(int bArray[], int iFilterLen) {
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++)
+    bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  return bTemp;
+}
