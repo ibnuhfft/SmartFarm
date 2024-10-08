@@ -1,0 +1,212 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ESP32Servo.h>
+
+// Firebase credentials
+#define FIREBASE_HOST "https://smart-integrated-farming-default-rtdb.firebaseio.com/"
+#define FIREBASE_AUTH "AIzaSyBC9d4A9XGmMhPxcfLLAgeEC0ttovw7qdA"
+
+// WiFi credentials
+const char* ssid = "smartfarm";
+const char* password = "123456789";
+
+// Define Firebase Data object
+FirebaseData firebaseData;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200, 60000);  // UTC+7 (25200 seconds offset)
+
+#define PH_SENSOR_PIN 35
+
+#define TURBIDITY_SENSOR_PIN 34
+#define ULTRASONIC_TRIGGER_PIN 12
+#define ULTRASONIC_ECHO_PIN 14
+#define RELAY_DRAIN_PIN 13
+#define RELAY_FILL_PIN 15
+
+#define PH_OFFSET_VOLTAGE 0.0
+#define TURBIDITY_OFFSET_VOLTAGE 0.0
+#define PH_BUFFER_SIZE 30
+#define TURBIDITY_BUFFER_SIZE 30
+
+float pHValues[PH_BUFFER_SIZE];
+float turbidityValues[TURBIDITY_BUFFER_SIZE];
+int pHBufferIndex = 0;
+int turbidityBufferIndex = 0;
+float avgpH = 0;
+float avgturbidity = 0;
+
+unsigned long drainStartTime = 0;
+unsigned long fillStartTime = 0;
+bool drainActive = false;
+bool fillActive = false;
+
+Servo myservo;
+const int servoPin = 18;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(ULTRASONIC_TRIGGER_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(RELAY_DRAIN_PIN, OUTPUT);
+  pinMode(RELAY_FILL_PIN, OUTPUT);
+  //pinMode(RELAY_FEED_PIN, OUTPUT);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize NTP client
+  timeClient.begin();
+}
+
+float readUltrasonicDistance() {
+  digitalWrite(ULTRASONIC_TRIGGER_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIGGER_PIN, LOW);
+
+  float duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH);
+  float distance = (duration * 0.0343) / 2;
+  return distance;
+
+  myservo.attach(servoPin);
+  myservo.write(0);
+}
+
+void loop() {
+  timeClient.update();
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+  int currentSecond = timeClient.getSeconds();
+
+  // Baca nilai tegangan dari sensor pH
+  float pHVoltage = analogRead(PH_SENSOR_PIN) * (3.3 / 4095.0);
+  float pHValue = 7 - (pHVoltage - PH_OFFSET_VOLTAGE) * (3.0 / 2.0);
+  pHValues[pHBufferIndex] = pHValue;
+  pHBufferIndex = (pHBufferIndex + 1) % PH_BUFFER_SIZE;
+
+  // Baca nilai tegangan dari sensor turbidity
+  float turbidityVoltage = analogRead(TURBIDITY_SENSOR_PIN * (5 / 4095.0));
+  float turbidityValue = 100.0 - (turbidityVoltage / 5) * 100.0;
+  Serial.print("TURB: ");
+  Serial.println(turbidityVoltage);
+
+  turbidityValues[turbidityBufferIndex] = turbidityValue;
+  turbidityBufferIndex = (turbidityBufferIndex + 1) % TURBIDITY_BUFFER_SIZE;
+
+  // Baca ketinggian air dalam kolam menggunakan sensor ultrasonik
+  float waterLevel = readUltrasonicDistance();
+
+  // Hitung nilai rata-rata pH dari buffer
+  float totalpH = 0;
+  for (int i = 0; i < PH_BUFFER_SIZE; i++) {
+    totalpH += pHValues[i];
+  }
+  avgpH = totalpH / PH_BUFFER_SIZE;
+
+  // Hitung nilai rata-rata turbidity dari buffer
+  float totalTurbidity = 0;
+  for (int i = 0; i < TURBIDITY_BUFFER_SIZE; i++) {
+    totalTurbidity += turbidityValues[i];
+  }
+  avgturbidity = totalTurbidity / TURBIDITY_BUFFER_SIZE;
+
+  // Menentukan status pH dan turbidity
+  String statpH = (pHValue >= 6.5 && pHValue <= 8.6) ? "1" : "0";
+  String statturb = (turbidityValue >= 0 && turbidityValue <= 180) ? "1" : "0";
+
+  // Tampilkan nilai pH, turbidity, dan ketinggian air dalam kolam
+  Serial.print("pH Value: ");
+  Serial.println(pHValue);
+  Serial.print("Turbidity Value: ");
+  Serial.println(turbidityValue);
+  Serial.print("Water Level: ");
+  Serial.print(waterLevel);
+  Serial.println(" cm");
+  Serial.print("Average pH: ");
+  Serial.println(avgpH);
+  Serial.print("Average Turbidity: ");
+  Serial.println(avgturbidity);
+  Serial.println("=====================");
+
+  // Kontrol relay berdasarkan nilai turbidity
+  int pumpDrain = 0;
+  int pumpFill = 0;
+
+  if (avgturbidity > 180) {
+    if (!drainActive && !fillActive) {
+      digitalWrite(RELAY_DRAIN_PIN, LOW);
+      drainStartTime = millis();
+      drainActive = true;
+      pumpDrain = 0;
+    }
+
+    if (drainActive && (millis() - drainStartTime >= 20000)) {
+      digitalWrite(RELAY_DRAIN_PIN, HIGH);
+      digitalWrite(RELAY_FILL_PIN, LOW);
+      fillStartTime = millis();
+      drainActive = false;
+      fillActive = true;
+      pumpDrain = 1;
+      pumpFill = 0;
+    }
+
+    if (fillActive && (millis() - fillStartTime >= 20000)) {
+      digitalWrite(RELAY_FILL_PIN, HIGH);
+      fillActive = false;
+      pumpFill = 1;
+    }
+  } else {
+    digitalWrite(RELAY_DRAIN_PIN, HIGH);
+    digitalWrite(RELAY_FILL_PIN, HIGH);
+    pumpDrain = 1;
+    pumpFill = 1;
+  }
+
+  // Kontrol relay untuk pemberian pakan otomatis
+  int feedRelay = 0;
+
+  if (currentHour == 20 && currentMinute == 24) {
+    myservo.write(90);
+    delay(5000);
+    feedRelay = 1;
+    delay(5000);
+    myservo.write(0);
+  } else if (currentHour == 16 && currentMinute == 0) {
+    myservo.write(90);
+    feedRelay = 2;
+  } else {
+    myservo.write(0);
+    Serial.print("pakan: ");
+    Serial.print(servoPin);
+    feedRelay = 0;
+  }
+
+  // Simpan data ke Firebase
+  String pHString = String(avgpH, 2);                // Format to 2 decimal places
+  String turbidityString = String(avgturbidity, 2);  // Format to 2 decimal places
+  Firebase.setString(firebaseData, "/S3/pH", pHString);
+  Firebase.setString(firebaseData, "S3/turb", turbidityString);
+  Firebase.setString(firebaseData, "/S3/waterLevel", waterLevel);
+  Firebase.setString(firebaseData, "/S3/pumpDrain", pumpDrain);
+  Firebase.setString(firebaseData, "/S3/pumpFill", pumpFill);
+  Firebase.setString(firebaseData, "/S3/statpH", statpH);
+  Firebase.setString(firebaseData, "/S3/statturb", statturb);
+  Firebase.setString(firebaseData, "/S3/pakan", feedRelay);
+  Firebase.setString(firebaseData, "/S3/ultra", waterLevel);
+
+  delay(1000);  // Tunggu satu detik sebelum membaca nilai sensor lagi
+}
